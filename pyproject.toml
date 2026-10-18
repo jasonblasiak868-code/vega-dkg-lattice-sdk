@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vega-dkg-lattice-sdk"
+version = "0.1.0"
+description = "DKG lattice: one node id across layers, repo and doc cards, markdown code nodes, combination hypotheses and graph-fact candidate verification."
+requires-python = ">=3.10"
+dependencies = ["vega-custody-sdk", "vega-harness-sdk"]
+license = {file = "LICENSE"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,6 +1,15 @@
 # vega-dkg-lattice-sdk
 ![vega-dkg-lattice-sdk](assets/tile.svg)
 
+<!-- vega-install-order -->
+> **Build order: 5/5. This kit needs 4 other Vega kits installed first.** Install them in this order, then this one:
+> 1/5 `vega-custody-sdk`  
+> 2/5 `vega-governance-jacket-sdk`  
+> 3/5 `vega-librarian-sdk`  
+> 4/5 `vega-harness-sdk`  
+> 5/5 `vega-dkg-lattice-sdk` (this kit)
+> Install each with `pip install --no-deps git+https://github.com/jasonblasiak868-code/<name>` in the order shown, plus `pip install cryptography`. Full steps: [INTEGRATION_GUIDE](https://github.com/jasonblasiak868-code/vega-umbrella-sdk/blob/main/INTEGRATION_GUIDE.md).
+
 The knowledge graph layer: every fact carries its origin and licence. This SDK builds the graph from a repo library (code nodes, repo/doc cards, crosswalk IDs) and from offline CC0 sources (Wikidata, OpenAlex, arXiv metadata). It owns layer 7 — the licence-aware knowledge graph and repository-library processing. The predictive lattice side (forecasting, routing, fidelity) lives in vega-reasoning-sdk predict.py and the galaxy repo.
 
 > **Licensing.** Source-available, not open source. Free for personal use; free for registered small businesses (under US$1M revenue and valuation); everyone else needs a commercial license (see LICENSE; for a commercial license write to jasonblasiak.ai.mail@gmail.com). Patent pending. Draft licence text, not yet reviewed by an attorney.

@@ -63,8 +63,10 @@ def build(repo, lib_root, out_root, crosswalk, matrix, groups):
     ver = _json_in(rd, "verify.json")
     sc = _json_in(rd, "score.json")
     dims = {k: (v.get("wilson_lower") if isinstance(v, dict) else None) for k, v in (sc.get("dimensions") or {}).items()}
-    inherit = {"license_class": row.get("license_class", "UNKNOWN"), "personal_build": row.get("personal_build"),
-               "public_build": row.get("public_build"), "taint_if_used": row.get("taint_if_used", True)}
+    def known(v):                                                        # a field the matrix does not have is not_scored, never an empty value that reads like "no"
+        return NS if v is None else v
+    inherit = {"license_class": row.get("license_class", "UNKNOWN"), "personal_build": known(row.get("personal_build")),
+               "public_build": known(row.get("public_build")), "taint_if_used": row.get("taint_if_used", True)}
     repo_id = vid.vega_id("library", repo, "repo", repo, "", 0)
     g = _json_in(rd, "graphify-out", "graph.json") or {"nodes": [], "links": []}
     nodes = [n for n in g.get("nodes", []) if isinstance(n, dict) and "id" in n]
@@ -96,12 +98,23 @@ def build(repo, lib_root, out_root, crosswalk, matrix, groups):
     mp = os.path.join(rd, "INGEST_MANIFEST.csv")
     if os.path.exists(mp):
         raw = sp.read_capped(sp.contained(rd, "INGEST_MANIFEST.csv"), MAX_MANIFEST).decode("utf-8", "replace")
-        for r in csv.DictReader(io.StringIO(raw, newline="")):
+        rows_in = list(csv.DictReader(io.StringIO(raw, newline="")))
+        kept_paths = [(r.get("detail") or "").replace("\\", "/").lower() for r in rows_in if r.get("disposition", "") == "KEPT"]
+        # An archive's top folder (for example basal-main/) is in the manifest paths but not in the graph paths. Strip it only when EVERY kept path shares one top folder and no graph path starts with
+        # that folder; otherwise a file such as src/a.py would borrow the nodes of a different top-level a.py.
+        tops = {p.split("/", 1)[0] for p in kept_paths}
+        strip = None
+        if kept_paths and len(tops) == 1 and all("/" in p for p in kept_paths):
+            top = next(iter(tops))
+            if not any(fp.startswith(top + "/") for fp in file_nodes):
+                strip = top
+        for r in rows_in:
             disp = r.get("disposition", "")
             detail = (r.get("detail") or "").replace("\\", "/")
             if disp == "KEPT":
                 kept += 1
-                nn = file_nodes.get(detail.lower(), 0) or file_nodes.get(detail.lower().split('/', 1)[-1], 0)      # graph paths have no leading repo folder
+                low = detail.lower()
+                nn = file_nodes.get(low, 0) or (file_nodes.get(low[len(strip) + 1:], 0) if strip and low.startswith(strip + "/") else 0)
                 covered += 1 if nn else 0
                 d = {"kind": "doc_node", "vega_id": vid.vega_id(repo, detail, "doc", os.path.basename(detail), "", 0), "repo": repo, "repo_vega_id": repo_id,
                      "path": detail, "sha256": r.get("sha256"), "code_nodes_in_file": nn, "inherited": inherit}
@@ -110,8 +123,8 @@ def build(repo, lib_root, out_root, crosswalk, matrix, groups):
             else:
                 skipped.append({"path": r.get("source_path"), "disposition": disp})
     repo_card = {"kind": "repo_node", "vega_id": repo_id, "repo": repo, "group": groups.get(repo, NS), **inherit,
-                 "audit_policy": row.get("audit_policy"), "audit_status": row.get("audit_status") or ver.get("status"),
-                 "archive_sha256": ver.get("archive_sha256"), "score_dimensions": dims or NS, "files_kept": kept,
+                 "audit_policy": known(row.get("audit_policy")), "audit_status": row.get("audit_status") or ver.get("status") or NS,
+                 "archive_sha256": known(ver.get("archive_sha256")), "score_dimensions": dims or NS, "files_kept": kept,
                  "files_skipped": len(skipped), "code_nodes": len(cards), "doc_nodes": len(docs), "graph_tag": repo}
     repo_card["dna_hash"] = h(repo_card)
     text = "".join(json.dumps(c, ensure_ascii=False) + "\n" for c in [repo_card] + docs + cards)

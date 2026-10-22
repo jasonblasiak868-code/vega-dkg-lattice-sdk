@@ -85,7 +85,9 @@ def py_symbols(src):
                     d[n.id] = d.get(n.id, 0) + 1
                 elif isinstance(n, ast.Call):
                     f = n.func
-                    calls.add(f.id if isinstance(f, ast.Name) else (f.attr if isinstance(f, ast.Attribute) else "?"))
+                    callee = f.id if isinstance(f, ast.Name) else (f.attr if isinstance(f, ast.Attribute) else None)
+                    if callee:                                       # a call through an index, a call result or a lambda has no name: it is not recorded as a shared "?"
+                        calls.add(callee)
                 elif isinstance(n, (ast.If, ast.For, ast.While, ast.AsyncFor, ast.IfExp, ast.ExceptHandler, ast.comprehension, ast.BoolOp)):
                     branch += 1
                 if isinstance(n, (ast.Try, getattr(ast, "TryStar", ast.Try))):
@@ -139,7 +141,9 @@ def ts_symbols(src_bytes, lang):
             elif x.type in call_k:
                 f = x.child_by_field_name("function") or x.child_by_field_name("name") or (x.children[0] if x.children else None)
                 if f is not None:
-                    calls.add(text(f).split("(")[0][-60:])
+                    callee = text(f).split("(")[0][-60:].strip()
+                    if callee:
+                        calls.add(callee)
             if x.type in br_k:
                 branch += 1
             if x.type in hd_k:
@@ -280,7 +284,8 @@ def build_repo(repo, lib_root, out_root, matrix, variables_path=None):
         lang, size = texts[path][1], texts[path][2]
         rel = path.replace("\\", "/")
         front = {"vega_id": vid.vega_id(repo, rel, "md_code_node", rel, "", 0), "repo": repo, "path": rel, "language": lang,
-                 "license_class": row.get("license_class", "UNKNOWN"), "use_boundary": row.get("personal_build"), "public_build": row.get("public_build"),
+                 "license_class": row.get("license_class", "UNKNOWN"), "use_boundary": row.get("personal_build") if row.get("personal_build") is not None else "not_scored",
+                 "public_build": row.get("public_build") if row.get("public_build") is not None else "not_scored",
                  "tainted_if_used": row.get("taint_if_used", True), "bytes": size, "symbols": len(syms) if syms is not None else "not_extracted",
                  "limits": "fan-in by name only; tested = name appears in a test file; scores are measurements, not a prediction"}
         scored = []

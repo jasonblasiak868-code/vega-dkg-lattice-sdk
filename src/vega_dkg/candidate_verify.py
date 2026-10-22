@@ -11,11 +11,14 @@ Safety: a repo name must be one plain path component (it names a card file); a c
 scores count as not passed instead of crashing; the card cache is keyed by (cards folder, repo) and by the file's modification time, so a changed card or another folder is never served stale."""
 import json
 import os
+import threading
 
 from vega_dkg import safe_paths as sp
 
 MAX_CARD_LINE = 8 * 1024 * 1024
+MAX_CACHE = 256                       # repo cards held in memory; the oldest is dropped first
 _cache = {}
+_cache_lock = threading.Lock()
 
 
 def _num(x):
@@ -31,7 +34,8 @@ def repo_facts(repo, cards):
     except OSError:
         return None
     key = (os.path.realpath(cards), repo)
-    hit = _cache.get(key)
+    with _cache_lock:
+        hit = _cache.get(key)
     if hit and hit[0] == stamp:
         return hit[1]
     try:
@@ -43,7 +47,11 @@ def repo_facts(repo, cards):
         first = first if isinstance(first, dict) and first.get("kind") == "repo_node" else None
     except (OSError, ValueError):
         first = None
-    _cache[key] = (stamp, first)
+    with _cache_lock:
+        _cache.pop(key, None)
+        _cache[key] = (stamp, first)
+        while len(_cache) > MAX_CACHE:
+            _cache.pop(next(iter(_cache)))
     return first
 
 

@@ -1,0 +1,21 @@
+"""Fixes in the dkg-lattice SDK, as (name, file, text_to_remove, replacement). Used by SDK_FAMILY/sdk_mutate.py. (knowledge_import has its own list in mutations_import.py.)"""
+MUTATIONS = [
+    ("writers take turns", "vega_id.py", '        self.con.execute("begin immediate")', "        pass"),
+    ("a repeated local id in one batch is handled", "vega_id.py", "if lid in seen_in_batch:", "if False:"),
+    ("a repeat with different content is a conflict", "vega_id.py", "if seen_in_batch[lid] == bk:", "if True:"),
+    ("card cache is bounded", "candidate_verify.py", "while len(_cache) > MAX_CACHE:", "while False:"),
+    ("missing matrix fields are not_scored", "cards.py", "return NS if v is None else v", "return v"),
+    ("a path is not matched by stripping its first folder blindly", "cards.py", "nn = file_nodes.get(low, 0) or (file_nodes.get(low[len(strip) + 1:], 0) if strip and low.startswith(strip + \"/\") else 0)", "nn = file_nodes.get(low, 0) or file_nodes.get(low.split('/', 1)[-1], 0)"),
+    ("the shared archive folder is stripped", "cards.py", "                strip = top", "                strip = None"),
+    ("front matter must open the file", "combine_finder.py", 'if not t.startswith("---\\n"):', "if False:"),
+    ("front matter has its required keys", "combine_finder.py", 'if not all(k in fm for k in ("path", "repo", "language")):', "if False:"),
+    ("an unnamed callee is not a shared call", "combine_finder.py", '{c for c in calls.group(1).split(", ") if c and c != "?"}', '{c for c in calls.group(1).split(", ")}'),
+    ("a repo listed twice is read once", "combine_finder.py", "for r in dict.fromkeys(repos):", "for r in repos:"),
+    ("min_overlap is checked", "combine_finder.py", "if isinstance(min_overlap, bool) or not isinstance(min_overlap, (int, float)) or not 0 <= min_overlap <= 1:", "if False:"),
+    ("dims are checked", "combine_finder.py", "if dims is not None and (isinstance(dims, (str, bytes)) or not isinstance(dims, (list, tuple, set, frozenset)) or any(d not in COMPLEMENT for d in dims)):", "if False:"),
+    ("very common call names are not used to find partners", "combine_finder.py", "if len(ids) <= MAX_POSTING:", "if True:"),
+    ("a forged path line does not stop the catalog", "catalog.py", "except ValueError:", "except ZeroDivisionError:"),
+    ("the catalog jsonl is written atomically", "catalog.py", 'sp.atomic_write(os.path.join(out_dir, "LIBRARY_IMPROVEMENT_CATALOG.jsonl"), "".join(jl))', 'open(os.path.join(out_dir, "LIBRARY_IMPROVEMENT_CATALOG.jsonl"), "w", encoding="utf-8").write("".join(jl))'),
+    ("an unnamed callee is not recorded", "md_nodes.py", "if callee:", "if True:"),
+    ("front matter says not_scored for a missing field", "md_nodes.py", 'row.get("personal_build") is not None else "not_scored"', 'True else "not_scored"'),
+]

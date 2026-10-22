@@ -124,7 +124,10 @@ def symbols_of(md_repo_dir):
             except (OSError, sp.PathRefused):
                 continue
             hm = re.search(r'^path: "(.*)"$', t, re.M)
-            rel = json.loads('"%s"' % hm.group(1)) if hm else os.path.relpath(p, md_repo_dir)
+            try:
+                rel = json.loads('"%s"' % hm.group(1)) if hm else os.path.relpath(p, md_repo_dir)
+            except ValueError:                                                        # a forged or damaged path line: use the file's own relative path
+                rel = os.path.relpath(p, md_repo_dir)
             for m in SYM.finditer(t):
                 kind, name, a, b, vid, sc, wk, st = m.groups()
                 yield rel, name, kind, int(a), int(b), vid, sc, wk, st
@@ -202,12 +205,11 @@ def build(library_root, md_root, matrix_path, groups_path, out_dir, top_repos=25
                     if s > 0:
                         items[cap].append({"capability": cap, "score": s if basis.startswith("name") else round(s * 0.5, 3), "basis": basis, "repo": name, "path": rel, "symbol": n, "kind": kind, "lines": f"{a}-{b}",
                                            "vega_id": vid, "license_class": rec["license_class"], "route": route, "contained_sandbox_required": rec["contained_sandbox_required"], "improves": TARGET[cap]})
-    with open(os.path.join(out_dir, "LIBRARY_IMPROVEMENT_CATALOG.jsonl"), "w", encoding="utf-8") as fh:
-        for r in repos:
-            fh.write(json.dumps({"type": "repo", **r}, sort_keys=True) + "\n")
-        for cap in items:
-            for it in sorted(items[cap], key=lambda x: -x["score"]):
-                fh.write(json.dumps({"type": "symbol", **it}, sort_keys=True) + "\n")
+    jl = [json.dumps({"type": "repo", **r}, sort_keys=True) + "\n" for r in repos]
+    for cap in items:
+        for it in sorted(items[cap], key=lambda x: -x["score"]):
+            jl.append(json.dumps({"type": "symbol", **it}, sort_keys=True) + "\n")
+    sp.atomic_write(os.path.join(out_dir, "LIBRARY_IMPROVEMENT_CATALOG.jsonl"), "".join(jl))
     lines = ["# LIBRARY IMPROVEMENT CATALOG", "",
              f"{len(repos)} repos dissected, every one classified: {sum(1 for r in repos if r['capabilities'])} by capability, the rest as a named domain, an excluded personal folder, a bundle, or an explicit 'needs a read'.",
              f"{len(repos)} repos dissected. Per capability: the repos most worth adopting or learning from, then the concrete symbols (function or class) to cherry-pick, with where each lives, its license route and which of OUR repos it would improve.",
@@ -223,10 +225,8 @@ def build(library_root, md_root, matrix_path, groups_path, out_dir, top_repos=25
         for it in top:
             lines.append(f"| {it['score']}{'*' if it['basis'].startswith('repo') else ''} | `{it['symbol']}` ({it['kind']}) | {it['repo']} | {it['path']}:{it['lines']} | {it['license_class']} | {'yes' if it['contained_sandbox_required'] else 'recommended'} |")
         lines.append("")
-    sp.atomic_write(os.path.join(out_dir, "LIBRARY_IMPROVEMENT_CATALOG.md"), "\n".join(lines) + "\n")
     lines2 = ["", "## Repos with no capability tag (every one is accounted for)", "", "| repo | classification |", "|---|---|"] + [f"| {r['repo']} | {r['classification']} |" for r in repos if not r["capabilities"]]
-    with open(os.path.join(out_dir, "LIBRARY_IMPROVEMENT_CATALOG.md"), "a", encoding="utf-8") as fh:
-        fh.write("\n".join(lines2) + "\n")
+    sp.atomic_write(os.path.join(out_dir, "LIBRARY_IMPROVEMENT_CATALOG.md"), "\n".join(lines) + "\n" + "\n".join(lines2) + "\n")
     return {"unclassified": sum(1 for r in repos if not r["classification"]), "needs_a_read": sum(1 for r in repos if (r["classification"] or "").startswith("NEEDS A READ")), "repos": len(repos), "tagged": sum(1 for r in repos if r["capabilities"]), "symbols": sum(len(v) for v in items.values()), "by_capability": {c: sum(1 for r in repos if c in r["capabilities"]) for c in CAPABILITIES}}
 
 

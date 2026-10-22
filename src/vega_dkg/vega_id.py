@@ -17,6 +17,7 @@ The crosswalk (SQLite) maps layer + local id -> vega id. A row is written once; 
 import hashlib
 import os
 import sqlite3
+import time
 
 PREFIX = "vn1_"
 MAX_FIELD = 100_000
@@ -49,6 +50,18 @@ class Crosswalk:
         self.path = path
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         self.con = sqlite3.connect(path, timeout=30)
+        for attempt in range(100):                       # two processes opening a brand-new file at once can see "database is locked" in the setup below; wait and try again
+            try:
+                self._setup()
+                break
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or attempt == 99:
+                    raise
+                if self.con.in_transaction:
+                    self.con.rollback()
+                time.sleep(0.05)
+
+    def _setup(self):
         self.con.execute("pragma journal_mode=wal")
         self.con.execute("""create table if not exists crosswalk(
             layer text not null, local_id text not null, vega_id text not null, universe text,
@@ -79,6 +92,16 @@ class Crosswalk:
             if not isinstance(r, dict) or "local_id" not in r:
                 raise IdRefused("every row is an object with a local_id")
         rows.sort(key=lambda r: str(r["local_id"]))
+        try:
+            return self._add_locked(layer, rows)
+        except sqlite3.Error:
+            if self.con.in_transaction:
+                self.con.rollback()
+            raise
+
+    def _add_locked(self, layer, rows):
+        # One writer at a time from the first read to the commit: two writers adding the same node would otherwise both read the same ordinal and the second would fail on the unique index.
+        self.con.execute("begin immediate")
         stored = {}
         for lid in {str(r["local_id"]) for r in rows}:
             got = self.con.execute("select vega_id, base_key from crosswalk where layer=? and local_id=?", (layer, lid)).fetchone()
@@ -87,6 +110,7 @@ class Crosswalk:
         offset = {}
         new, unchanged, conflicts = [], 0, []
         counts = {}
+        seen_in_batch = {}
         for r in rows:
             tup = tuple(_n(r.get(k)) for k in ("universe", "path", "kind", "label", "location"))
             bk = _base_key(tup)
@@ -97,22 +121,25 @@ class Crosswalk:
                 else:
                     conflicts.append({"local_id": lid, "stored_vega_id": stored[lid][0], "reason": "the stored row describes a different node; the original id is kept"})
                 continue
+            if lid in seen_in_batch:                                  # the same local id listed twice in one call: the first stands, a repeat is unchanged or a reported conflict
+                if seen_in_batch[lid] == bk:
+                    unchanged += 1
+                else:
+                    conflicts.append({"local_id": lid, "stored_vega_id": None, "reason": "the same local_id is listed twice in this batch with different content; the first is kept"})
+                continue
+            seen_in_batch[lid] = bk
             if bk not in offset:
                 offset[bk] = self.con.execute("select count(*) from crosswalk where layer=? and base_key=?", (layer, bk)).fetchone()[0]
             o = offset[bk]
             offset[bk] = o + 1
             counts[bk] = counts.get(bk, 0) + 1
             new.append((layer, lid, vega_id(r.get("universe"), r.get("path"), r.get("kind"), r.get("label"), r.get("location"), o), r.get("universe"), bk))
-        try:
-            self.con.executemany("insert into crosswalk(layer, local_id, vega_id, universe, collision_group, base_key) values (?,?,?,?,1,?)", new)
-            groups = {bk for bk in counts}
-            for bk in groups:
-                n = self.con.execute("select count(*) from crosswalk where layer=? and base_key=?", (layer, bk)).fetchone()[0]
-                self.con.execute("update crosswalk set collision_group=? where layer=? and base_key=?", (n, layer, bk))
-            self.con.commit()
-        except sqlite3.Error:
-            self.con.rollback()
-            raise
+        self.con.executemany("insert into crosswalk(layer, local_id, vega_id, universe, collision_group, base_key) values (?,?,?,?,1,?)", new)
+        groups = {bk for bk in counts}
+        for bk in groups:
+            n = self.con.execute("select count(*) from crosswalk where layer=? and base_key=?", (layer, bk)).fetchone()[0]
+            self.con.execute("update crosswalk set collision_group=? where layer=? and base_key=?", (n, layer, bk))
+        self.con.commit()
         return {"rows": len(rows), "added": len(new), "unchanged": unchanged, "conflicts": conflicts}
 
     def lookup(self, layer, local_id):

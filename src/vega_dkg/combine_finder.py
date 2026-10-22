@@ -19,23 +19,29 @@ from vega_harness import use_gate as ug
 COMPLEMENT = {"no error handling": "handles errors", "undocumented": "documented", "long": "small", "high branching": "low branching"}
 MAX_NODE_BYTES = 5 * 1024 * 1024
 MAX_POOL = 200_000
+MAX_POSTING = 1000                    # a call name shared by more functions than this says nothing about any pair, so it is not used to look for partners
 _SYM = re.compile(r"^## (function|class) `([^`\n]+)` L(\d+)-(\d+)  \((vn1_\w+)\)\n- scores: (.*)\n- weaknesses: (.*)\n- strengths: (.*)\n", re.M)
 
 
 def parse_node(path):
     """One md code node -> dict, or None if it is not a well-formed node."""
-    t = sp.read_capped(path, MAX_NODE_BYTES).decode("utf-8", errors="replace")
-    parts = t.split("---")
-    if len(parts) < 3:
+    t = sp.read_capped(path, MAX_NODE_BYTES).decode("utf-8", errors="replace").replace("\r\n", "\n")
+    if not t.startswith("---\n"):                                  # the front matter must open the file: a "---" later in a body is not one
         return None
-    fm = dict(re.findall(r"^(\w+): (.*)$", parts[1], re.M))
+    end = t.find("\n---\n", 4)
+    if end < 0:
+        return None
+    fm = dict(re.findall(r"^(\w+): (.*)$", t[4:end], re.M))
+    if not all(k in fm for k in ("path", "repo", "language")):
+        return None
+    t = t[end + 5:]
     syms = []
     for m in _SYM.finditer(t):
         kind, name, a, b, vid, sc, wk, st = m.groups()
         fi = re.search(r"fan_in_by_name=(\d+)", sc)
         calls = re.search(r"- calls: (.*)", t[m.end():m.end() + 4000].split("\n## ")[0])
         syms.append({"vega_id": vid, "name": name, "kind": kind, "lines": max(1, int(b) - int(a) + 1), "weak": wk, "strong": st,
-                     "calls": set(calls.group(1).split(", ")) if calls else set(), "fan_in": int(fi.group(1)) if fi else 0,
+                     "calls": {c for c in calls.group(1).split(", ") if c and c != "?"} if calls else set(), "fan_in": int(fi.group(1)) if fi else 0,
                      "tested": "tested_by_name=True" in sc})
     try:
         return {"path": json.loads(fm.get("path", '""')), "repo": json.loads(fm.get("repo", '""')), "language": json.loads(fm.get("language", '""')),
@@ -47,7 +53,7 @@ def parse_node(path):
 def load(repos, root):
     """Returns (nodes, report). report counts what was skipped and why."""
     nodes, report = [], {"files": 0, "skipped_too_big": 0, "skipped_malformed": 0, "skipped_unsafe": 0}
-    for r in repos:
+    for r in dict.fromkeys(repos):                                  # a repo listed twice is read once
         sp.safe_name(r)
         base = sp.contained(root, r)
         for dp, _, fs in os.walk(base):
@@ -78,6 +84,10 @@ def propose(nodes, top=20, min_overlap=0.1, dims=None):
     """dims: only these weakness dimensions (goal-conditioning); None = all. Returns the best `top` hypothesis cards, best first."""
     if isinstance(top, bool) or not isinstance(top, int) or top < 0:
         raise ValueError("top is a whole number, 0 or more")
+    if isinstance(min_overlap, bool) or not isinstance(min_overlap, (int, float)) or not 0 <= min_overlap <= 1:
+        raise ValueError("min_overlap is a number from 0 to 1 (0 turns the search off)")
+    if dims is not None and (isinstance(dims, (str, bytes)) or not isinstance(dims, (list, tuple, set, frozenset)) or any(d not in COMPLEMENT for d in dims)):
+        raise ValueError("dims is a list of weakness dimensions from %s" % sorted(COMPLEMENT))
     pool = [(n, s) for n in nodes for s in n["syms"] if s["kind"] == "function"]
     if len(pool) > MAX_POOL:
         raise ValueError(f"{len(pool)} functions is over the {MAX_POOL} limit: run per repo or per language")
@@ -92,7 +102,9 @@ def propose(nodes, top=20, min_overlap=0.1, dims=None):
             continue
         partners = set()
         for c in a["calls"]:
-            partners.update(by_call.get(c, ()))
+            ids = by_call.get(c, ())
+            if len(ids) <= MAX_POSTING:
+                partners.update(ids)
         for ib in partners:
             nb, b = pool[ib]
             if ib == ia or nb["language"] != na["language"] or b["name"] == a["name"]:

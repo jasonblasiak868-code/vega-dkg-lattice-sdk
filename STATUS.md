@@ -10,7 +10,7 @@
 - safe_paths
 - knowledge_import
 
-Tests: 96 tests in 6 files, all passing.
+Tests: 133 tests in 9 files, all passing. Every fix in `tests/mutations.py` was checked by undoing it and confirming a test fails (see CHANGELOG.md).
 
 ## DESIGNED ONLY (not built)
 

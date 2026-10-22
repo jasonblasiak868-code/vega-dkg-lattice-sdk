@@ -98,7 +98,7 @@ print(vid.vega_id('myrepo', 'src/main.py', 'function', 'fetch', 'L10', 0))
 
 ## Tests
 
-96 tests in 6 files, all passing (STATUS.md). Run with the dependency `src/` folders on PYTHONPATH:
+133 tests in 9 files, all passing (STATUS.md). Run with the dependency `src/` folders on PYTHONPATH:
 
 ```bash
 python -m pytest tests/ -v

@@ -59,6 +59,59 @@ class ProcessRefused(ValueError):
     pass
 
 
+class _MatrixLock:
+    """A lock file beside the use matrix, so two runs adding rows cannot overwrite each other's row."""
+
+    def __init__(self, path, timeout=60.0):
+        self.path, self.timeout, self.fd = path + ".lock", timeout, None
+
+    def __enter__(self):
+        end = time.time() + self.timeout
+        while True:
+            try:
+                self.fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                return self
+            except FileExistsError:
+                try:
+                    if time.time() - os.path.getmtime(self.path) > 300:          # a lock left by a crashed run
+                        os.remove(self.path)
+                        continue
+                except OSError:
+                    pass
+                if time.time() > end:
+                    raise ProcessRefused("the use matrix is locked by another run")
+                time.sleep(0.05)
+
+    def __exit__(self, *a):
+        os.close(self.fd)
+        try:
+            os.remove(self.path)
+        except OSError:
+            pass
+
+
+def add_matrix_row(cfg, row):
+    """Add one row to the use matrix. The file is re-read under a lock, so rows added by other runs since this run started are kept, and a repo that already has a row is refused. Returns the rows."""
+    with _MatrixLock(cfg.matrix_path):
+        with open(cfg.matrix_path, encoding="utf-8") as fh:
+            rows = json.load(fh)
+        if not isinstance(rows, list):
+            raise ProcessRefused("the use matrix is a list of repo rows")
+        if any(isinstance(r, dict) and r.get("repo") == row["repo"] for r in rows):
+            raise ProcessRefused(f"{row['repo']} already has a row in the use matrix")
+        bak = cfg.matrix_path + ".bak_" + time.strftime("%Y%m%d")
+        if not os.path.exists(bak):
+            shutil.copyfile(cfg.matrix_path, bak)
+        rows.append(row)
+        sp.atomic_write(cfg.matrix_path, json.dumps(rows, indent=1))
+        return rows
+
+
+def _secret_named(name):
+    low = name.lower()
+    return low.startswith(".env") and not low.endswith((".example", ".sample", ".template"))
+
+
 class Config:
     def __init__(self, vetting_dir, library, md_out, one_plane, matrix_path, dag_dir, neo4j_db="codegraphs", graphify="graphify", loader=None, load_dkg=True, timeout=3600):
         self.vetting_dir, self.library, self.md_out, self.one_plane = map(str, (vetting_dir, library, md_out, one_plane))
@@ -138,13 +191,13 @@ def stage_vet(root):
                 continue
             ext = os.path.splitext(low)[1]
             is_test = bool(TEST_RX.search(rel))
-            if LICENSE_FILES.match(os.path.splitext(f)[0]) or LICENSE_FILES.match(f):
+            if (LICENSE_FILES.match(os.path.splitext(f)[0]) or LICENSE_FILES.match(f)) and ext in ("", ".md", ".txt", ".rst"):          # a source file called license_utils.py is not a licence
                 try:
                     text = sp.read_capped(p, 1 << 20).decode("utf-8", "replace")
                 except (OSError, sp.PathRefused):
                     continue
                 hits = [(c, label) for rx, c, label in LICENSE_RULES if rx.search(text[:20000])]
-                lic_found.append({"file": rel, "matches": [h[1] for h in hits], "class": strictest([h[0] for h in hits]) if hits else "NO_LICENSE_FILE"})
+                lic_found.append({"file": rel, "matches": [h[1] for h in hits], "class": strictest([h[0] for h in hits]) if hits else "NO_LICENSE_FILE", "root": "/" not in rel})
             if ext not in TEXT_EXT:
                 continue
             try:
@@ -164,9 +217,13 @@ def stage_vet(root):
             for h in HOST_RX.findall(text[:400_000]):
                 if not any(x in h.lower() for x in PLACEHOLDER_HOSTS):
                     hosts[h.lower()] = hosts.get(h.lower(), 0) + 1
-    classes = [x["class"] for x in lic_found if x["matches"]]
-    cls = strictest(classes) if classes else "NO_LICENSE_FILE"
+    # Only a licence file at the root licenses the repo. A licence inside a subfolder (vendored code) covers the code it sits with: it can make the class STRICTER, never more permissive.
+    root_classes = [x["class"] for x in lic_found if x["matches"] and x["root"]]
+    sub_classes = [x["class"] for x in lic_found if x["matches"] and not x["root"] and x["class"] != "PERMISSIVE"]
+    cls = strictest(root_classes + sub_classes) if (root_classes or sub_classes) else "NO_LICENSE_FILE"
     flags = []
+    if not root_classes and any(x["matches"] and not x["root"] for x in lic_found):
+        flags.append("license file(s) found only in subfolders: they license the code they sit with, not this repo, which states no license of its own")
     if secrets:
         flags.append(f"{len(secrets)} file(s) hold credential-shaped values (often test fixtures: read before trusting)")
     if installers:
@@ -188,20 +245,28 @@ def stage_library(archive, cfg, name, root, vet, intake, matrix_rows, cls):
         raise ProcessRefused(f"{dst} already exists in the library: leaving it alone")
     if any(r.get("repo") == name for r in matrix_rows):
         raise ProcessRefused(f"{name} already has a row in the use matrix")
-    shutil.copytree(root, os.path.join(dst, name), ignore=shutil.ignore_patterns("node_modules", ".git"))
+    base_ignore = shutil.ignore_patterns("node_modules", ".git")
+
+    def ignore(src_dir, names):                                                          # a secret-named file or folder is listed in the ledger but never copied into the library
+        return set(base_ignore(src_dir, names)) | {n for n in names if _secret_named(n)}
+    shutil.copytree(root, os.path.join(dst, name), ignore=ignore)
     rows, kept, code, tests, docs = [], 0, 0, 0, 0
     for dp, _, fs in os.walk(os.path.join(dst, name)):
         for f in fs:
             p = os.path.join(dp, f)
             rel = os.path.relpath(p, dst).replace("\\", "/")
-            sec = f.lower().startswith(".env") and not f.lower().endswith((".example", ".sample", ".template"))
-            rows.append((p, "" if sec else sha256_file(p), "SKIPPED_SECRET" if sec else "KEPT", "name matches secret pattern" if sec else rel))
-            if not sec:
-                kept += 1
-                ext = os.path.splitext(f)[1].lower()
-                code += ext in CODE_EXT
-                tests += ext in CODE_EXT and bool(TEST_RX.search(rel))
-                docs += ext in (".md", ".rst", ".txt")
+            rows.append((p, sha256_file(p), "KEPT", rel))
+            kept += 1
+            ext = os.path.splitext(f)[1].lower()
+            code += ext in CODE_EXT
+            tests += ext in CODE_EXT and bool(TEST_RX.search(rel))
+            docs += ext in (".md", ".rst", ".txt")
+    for dp, dn, fs in os.walk(root):
+        dn[:] = [d for d in dn if d not in ("node_modules", ".git")]
+        for n in list(dn) + fs:
+            if _secret_named(n):
+                rows.append((os.path.join(dst, name, os.path.relpath(os.path.join(dp, n), root)), "", "SKIPPED_SECRET", "name matches secret pattern"))
+        dn[:] = [d for d in dn if not _secret_named(d)]
     with open(os.path.join(dst, "INGEST_MANIFEST.csv"), "w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
         w.writerow(["source_path", "sha256", "disposition", "detail"])
@@ -210,9 +275,9 @@ def stage_library(archive, cfg, name, root, vet, intake, matrix_rows, cls):
               "ledger_total": len(rows), "status": "COMPLETE", "license": f"{cls} ({', '.join(vet['declared_licenses']) or 'no declared license'})", "vet_verdict": vet["verdict"]}
     with open(os.path.join(dst, "verify.json"), "w", encoding="utf-8") as fh:
         json.dump(verify, fh, indent=1)
-    row = {"repo": name, "license_class": cls, "audit_policy": "processed by vega_dkg.process; static vet only; contained use", "personal_build": "contained use; output TAINTED" if cls != "PERMISSIVE" else "contained use; output TAINTED",
+    row = {"repo": name, "license_class": cls, "audit_policy": "processed by vega_dkg.process; static vet only; contained use", "personal_build": "contained use; output TAINTED",
            "public_build": "clean-room only", "sdk_pack": "card+scores+license+pointer", "taint_if_used": True, "files": kept, "audit_status": "COMPLETE"}
-    return {"library_path": dst, "kept": kept, "code_files": code, "test_files": tests, "doc_files": docs, "matrix_row": row}
+    return {"library_path": dst, "kept": kept, "ledger_total": len(rows), "code_files": code, "test_files": tests, "doc_files": docs, "matrix_row": row}
 
 
 def stage_graph(cfg, name, timeout):
@@ -252,11 +317,14 @@ def stage_scores(cfg, name, lib, md, graph_path):
         touched.add(e.get("target"))
         internal += e.get("source") in ids and e.get("target") in ids
         extracted += str(e.get("confidence")) == "EXTRACTED"
-    vrows = [json.loads(line) for line in open(md["variables_path"], encoding="utf-8")] if md.get("variables_path") and os.path.getsize(md["variables_path"]) else []
+    vrows = []
+    if md.get("variables_path") and os.path.getsize(md["variables_path"]):
+        with open(md["variables_path"], encoding="utf-8") as vf:
+            vrows = [json.loads(line) for line in vf]
     syms = {}
     for v in vrows:
         syms.setdefault(v["symbol_vega_id"], v)
-    dims = {"provenance_completeness": {"wilson_lower": wilson(lib["kept"], lib["kept"]), "pos": lib["kept"], "n": lib["kept"]},
+    dims = {"provenance_completeness": {"wilson_lower": wilson(lib["kept"], lib.get("ledger_total", lib["kept"])), "pos": lib["kept"], "n": lib.get("ledger_total", lib["kept"])},
             "documentation_share": {"wilson_lower": wilson(lib["doc_files"], lib["kept"]), "pos": lib["doc_files"], "n": lib["kept"]},
             "test_share_of_code": {"wilson_lower": wilson(lib["test_files"], lib["code_files"]), "pos": lib["test_files"], "n": lib["code_files"]},
             "graph_connectedness": {"wilson_lower": wilson(len(ids & touched), len(ids)), "pos": len(ids & touched), "n": len(ids)},
@@ -330,6 +398,8 @@ def use_text(cls):
 # ----------------------------------------------------------------------------------------------------------------------------- driver
 def process(archive, cfg, name=None, license_class=None):
     """Run every stage. Returns {"complete": bool, "name", "stages": {stage: receipt or failure}, "failed_at": stage or None}."""
+    if license_class is not None and license_class not in STRICT:
+        raise ProcessRefused(f"license class {license_class!r} is not one of {STRICT}")
     archive = os.path.abspath(archive)
     name = name if name is not None else re.sub(r"\.zip$", "", os.path.basename(archive), flags=re.I)
     receipts, failed = {}, None
@@ -357,13 +427,12 @@ def process(archive, cfg, name=None, license_class=None):
     run("extract", lambda: stage_extract(archive, cfg, name))
     run("vet", lambda: stage_vet(state["extract"]["source_root"]))
     cls = license_class or (state.get("vet") or {}).get("license_class", "NO_LICENSE_FILE")
-    run("library", lambda: stage_library(archive, cfg, name, state["extract"]["source_root"], state["vet"], state["intake"], matrix_rows, cls))
-    if not failed:                                                                    # the matrix row is written only after the library copy fully succeeded
-        matrix_rows.append(state["library"]["matrix_row"])
-        bak = cfg.matrix_path + ".bak_" + time.strftime("%Y%m%d")
-        if not os.path.exists(bak):
-            shutil.copyfile(cfg.matrix_path, bak)
-        sp.atomic_write(cfg.matrix_path, json.dumps(matrix_rows, indent=1))
+    def do_library():
+        lib = stage_library(archive, cfg, name, state["extract"]["source_root"], state["vet"], state["intake"], matrix_rows, cls)
+        rows = add_matrix_row(cfg, lib["matrix_row"])                                  # only after the library copy fully succeeded, and re-read under a lock so no other run's row is lost
+        matrix_rows[:] = rows
+        return lib
+    run("library", do_library)
     matrix = {r["repo"]: r for r in matrix_rows}
     vpath = os.path.join(cfg.library, name, "variables.jsonl")
     run("md_nodes", lambda: {**md_nodes.build_repo(name, cfg.library, cfg.md_out, matrix, variables_path=vpath), "variables_path": vpath})
@@ -420,17 +489,19 @@ def refresh(name, cfg):
     md = {**md_nodes.build_repo(name, cfg.library, cfg.md_out, matrix, variables_path=vpath), "variables_path": vpath}
     with vega_id.Crosswalk(os.path.join(cfg.one_plane, "crosswalk.db")) as cw:
         c = cards.build(name, cfg.library, cfg.one_plane, cw, matrix, cards.load_groups(None))
-    kept = sum(1 for _ in open(os.path.join(rd, "INGEST_MANIFEST.csv"), encoding="utf-8")) - 1
+    kept = total = 0
     code = tests = docs = 0
     with open(os.path.join(rd, "INGEST_MANIFEST.csv"), encoding="utf-8", newline="") as fh:
         for row in csv.DictReader(fh):
+            total += 1
             if row["disposition"] != "KEPT":
                 continue
+            kept += 1
             ext = os.path.splitext(row["detail"])[1].lower()
             code += ext in CODE_EXT
             tests += ext in CODE_EXT and bool(TEST_RX.search(row["detail"]))
             docs += ext in (".md", ".rst", ".txt")
-    lib = {"kept": kept, "code_files": code, "test_files": tests, "doc_files": docs}
+    lib = {"kept": kept, "ledger_total": total, "code_files": code, "test_files": tests, "doc_files": docs}
     sc = stage_scores(cfg, name, lib, md, os.path.join(rd, "graphify-out", "graph.json"))
     return {"md_nodes": {k: md[k] for k in ("files", "symbols", "variables", "failed", "not_extracted")}, "cards": {k: c[k] for k in ("code_nodes", "files_with_nodes")}, "scores": sc["dimensions"]}
 

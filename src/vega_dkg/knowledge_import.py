@@ -23,6 +23,7 @@ import json
 import os
 
 from vega_dkg import cards as dkgcards
+from vega_dkg.safe_paths import atomic_write
 from vega_dkg import vega_id as vid
 
 MAX_LINE = 8 * 1024 * 1024
@@ -83,7 +84,7 @@ def iter_json_lines(path, stats, max_line=MAX_LINE):
                 s = s[:-1]
             try:
                 yield json.loads(s.decode("utf-8"))
-            except (ValueError, UnicodeDecodeError):
+            except (ValueError, UnicodeDecodeError, RecursionError):                # RecursionError: a line nested too deeply to decode is a bad line, not a crash
                 stats["bad_json"] = stats.get("bad_json", 0) + 1
 
 
@@ -148,33 +149,34 @@ def _wd_targets(claims, prop=None):
 
 
 def wikidata_records(entity: dict, flt: Filter, stats: dict):
-    """-> (nodes, edges, referenced_target_ids) for one dump line, or ([], [], []) if the filter or the shape says skip."""
+    """-> (nodes, edges, referenced_target_ids) for one dump line, or ([], [], []) if the filter or the shape says skip. A shape this code does not understand is counted, never guessed and never fatal."""
     try:
         qid = entity["id"]
         if entity.get("type") != "item" or not isinstance(qid, str) or not qid.startswith("Q") or not qid[1:].isdigit():
             stats["skipped_shape"] = stats.get("skipped_shape", 0) + 1
             return [], [], []
-    except (KeyError, TypeError, AttributeError):
+        if flt.qids is not None and qid not in flt.qids:
+            return [], [], []
+        claims = entity.get("claims") or {}
+        targets = _wd_targets(claims)
+        if flt.instance_of is not None and not any(p == "P31" and t in flt.instance_of for p, t, _, _ in targets):
+            return [], [], []
+        labels, descs = {}, {}
+        for lang in flt.languages:
+            v = (entity.get("labels") or {}).get(lang)
+            if isinstance(v, dict) and isinstance(v.get("value"), str):
+                labels[lang] = v["value"]
+            d = (entity.get("descriptions") or {}).get(lang)
+            if isinstance(d, dict) and isinstance(d.get("value"), str):
+                descs[lang] = d["value"]
+        label = labels.get(flt.languages[0]) or next(iter(labels.values()), dkgcards.NS)
+        node = _node("wikidata", "wd_item", qid, label, {"labels": labels, "descriptions": descs, "instance_of": sorted({t for p, t, _, _ in targets if p == "P31"}),
+                                                          "statement_count": sum(len(v or []) for v in claims.values())})
+        edges = [_edge("wikidata", p, "wd_item", qid, "wd_item", t, {"references": n, "referenced": n > 0, "rank": rank}) for p, t, n, rank in targets]
+        return [node], edges, sorted({t for _, t, _, _ in targets})
+    except (KeyError, TypeError, AttributeError, ValueError):
         stats["skipped_shape"] = stats.get("skipped_shape", 0) + 1
         return [], [], []
-    if flt.qids is not None and qid not in flt.qids:
-        return [], [], []
-    claims = entity.get("claims") or {}
-    targets = _wd_targets(claims)
-    if flt.instance_of is not None and not any(p == "P31" and t in flt.instance_of for p, t, _, _ in targets):
-        return [], [], []
-    labels, descs = {}, {}
-    for lang in flt.languages:
-        v = (entity.get("labels") or {}).get(lang)
-        if isinstance(v, dict) and isinstance(v.get("value"), str):
-            labels[lang] = v["value"]
-        d = (entity.get("descriptions") or {}).get(lang)
-        if isinstance(d, dict) and isinstance(d.get("value"), str):
-            descs[lang] = d["value"]
-    label = labels.get(flt.languages[0]) or next(iter(labels.values()), dkgcards.NS)
-    node = _node("wikidata", "wd_item", qid, label, {"labels": labels, "descriptions": descs, "instance_of": sorted({t for p, t, _, _ in targets if p == "P31"}), "statement_count": sum(len(v or []) for v in claims.values())})
-    edges = [_edge("wikidata", p, "wd_item", qid, "wd_item", t, {"references": n, "referenced": n > 0, "rank": rank}) for p, t, n, rank in targets]
-    return [node], edges, sorted({t for _, t, _, _ in targets})
 
 
 def _oa_id(url):
@@ -189,22 +191,29 @@ def openalex_records(work: dict, flt: Filter, stats: dict):
     except (KeyError, TypeError, AttributeError):
         stats["skipped_shape"] = stats.get("skipped_shape", 0) + 1
         return [], [], []
-    title = work.get("title") or work.get("display_name") or dkgcards.NS
+    title = work.get("title") if isinstance(work.get("title"), str) and work.get("title") else (work.get("display_name") if isinstance(work.get("display_name"), str) and work.get("display_name") else dkgcards.NS)
     node = _node("openalex", "paper", wid, title, {"year": work.get("publication_year"), "doi": work.get("doi"), "work_type": work.get("type"), "abstract_present": bool(work.get("abstract_inverted_index"))})
-    edges, refs = [], []
-    for ref in work.get("referenced_works") or []:
+    nodes, edges, refs = [node], [], []
+    refw = work.get("referenced_works")
+    if refw is not None and not isinstance(refw, (list, tuple)):                  # text where a list belongs would be read letter by letter into false citations
+        stats["bad_references"] = stats.get("bad_references", 0) + 1
+        refw = []
+    for ref in refw or []:
         rid = _oa_id(ref)
         if rid:
             edges.append(_edge("openalex", "CITES", "paper", wid, "paper", rid))
             refs.append(rid)
-    for a in work.get("authorships") or []:
+    auth = work.get("authorships")
+    for a in (auth if isinstance(auth, (list, tuple)) else []):
         try:
             aid = _oa_id(a["author"]["id"])
             if aid:
-                edges.append(_edge("openalex", "AUTHORED_BY", "paper", wid, "author", aid, {"author_name": a["author"].get("display_name")}))
-        except (KeyError, TypeError):
+                name = a["author"].get("display_name")
+                nodes.append(_node("openalex", "author", aid, name if isinstance(name, str) and name else dkgcards.NS, {"from_authorship": True}))      # an edge must not point at nothing: the author is a node too
+                edges.append(_edge("openalex", "AUTHORED_BY", "paper", wid, "author", aid, {"author_name": name}))
+        except (KeyError, TypeError, AttributeError):
             continue
-    return [node], edges, refs
+    return nodes, edges, refs
 
 
 def arxiv_records(rec: dict, flt: Filter, stats: dict):
@@ -216,7 +225,7 @@ def arxiv_records(rec: dict, flt: Filter, stats: dict):
         stats["skipped_shape"] = stats.get("skipped_shape", 0) + 1
         return [], [], []
     abstract = rec.get("abstract") if isinstance(rec.get("abstract"), str) else ""
-    node = _node("arxiv", "paper", aid, rec.get("title") or dkgcards.NS, {"categories": str(rec.get("categories") or "").split(), "authors": rec.get("authors"),
+    node = _node("arxiv", "paper", aid, rec.get("title") if isinstance(rec.get("title"), str) and rec.get("title") else dkgcards.NS, {"categories": str(rec.get("categories") or "").split(), "authors": rec.get("authors"),
                                                                            "updated": rec.get("update_date"), "abstract_sha256": hashlib.sha256(abstract.encode("utf-8")).hexdigest() if abstract else None, "abstract_chars": len(abstract)})
     return [node], [], []
 
@@ -251,7 +260,7 @@ class PartWriter:
 
     def write(self, rec: dict) -> bool:
         line = (json.dumps(rec, sort_keys=True, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
-        if len(line) > MAX_RECORD:
+        if len(line) > min(MAX_RECORD, self.max):                      # a record that cannot fit in a part is refused, so no part is ever larger than the limit it was given
             return False
         if self._fh is not None and self._bytes + len(line) > self.max:
             self._close()
@@ -266,6 +275,12 @@ class PartWriter:
     def finish(self):
         self._close()
         return self.parts
+
+    def abort(self):
+        """Close the open part without recording it (used when the import fails part-way)."""
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
 
 
 def batch_sha256(parts) -> str:
@@ -282,9 +297,19 @@ def import_dump(path, source, out_dir, flt: Filter = None, max_part_bytes=MAX_PA
     flt = flt or Filter()
     adapter = ADAPTERS[source]
     stats = {}
+    if os.path.isdir(os.fspath(out_dir)) and any(f.startswith(source + "-") and f.endswith((".jsonl", "-MANIFEST.json")) or f == source + "-MANIFEST.json" for f in os.listdir(os.fspath(out_dir))):
+        raise ImportRefused("%s already holds an import of %s: use a new folder (an earlier batch and its manifest must not be overwritten)" % (os.fspath(out_dir), source))
     writer = PartWriter(out_dir, source, max_part_bytes)
     seen, wanted_targets, n_nodes, n_edges, dup = set(), set(), 0, 0, 0
     dump_sha = sha256_file(path)
+    try:
+        return _run_import(path, source, out_dir, flt, adapter, stats, writer, seen, wanted_targets, n_nodes, n_edges, dup, dump_sha, stubs, max_ids)
+    except BaseException:
+        writer.abort()
+        raise
+
+
+def _run_import(path, source, out_dir, flt, adapter, stats, writer, seen, wanted_targets, n_nodes, n_edges, dup, dump_sha, stubs, max_ids):
     for obj in iter_json_lines(path, stats):
         if flt.max_nodes is not None and n_nodes >= flt.max_nodes:
             stats["stopped_at_max_nodes"] = True
@@ -307,6 +332,8 @@ def import_dump(path, source, out_dir, flt: Filter = None, max_part_bytes=MAX_PA
             else:
                 stats["record_too_large"] = stats.get("record_too_large", 0) + 1
         wanted_targets.update(targets)
+        if len(wanted_targets) + len(seen) > max_ids:
+            raise ImportRefused("more than %d distinct ids (items plus edge targets): raise max_ids deliberately or filter harder" % max_ids)
     n_stubs = 0
     if stubs:                                                         # an edge must not point at nothing: targets outside the filter get a bare stub node, clearly not extracted from an item
         for tid in sorted(wanted_targets):
@@ -321,8 +348,7 @@ def import_dump(path, source, out_dir, flt: Filter = None, max_part_bytes=MAX_PA
     manifest = {"version": 1, "source": source, "license": SOURCES[source]["license"], "license_class": SOURCES[source]["license_class"], "tainted": SOURCES[source]["taint"],
                 "dump_file": os.path.basename(os.fspath(path)), "dump_sha256": dump_sha, "parts": parts, "counts": {"nodes": n_nodes, "edges": n_edges, "stubs": n_stubs, "duplicates": dup},
                 "skipped": stats, "batch_sha256": batch_sha256(parts)}
-    with open(os.path.join(os.fspath(out_dir), "%s-MANIFEST.json" % source), "w", encoding="utf-8") as fh:
-        json.dump(manifest, fh, indent=1, sort_keys=True)
+    atomic_write(os.path.join(os.fspath(out_dir), "%s-MANIFEST.json" % source), json.dumps(manifest, indent=1, sort_keys=True))
     return manifest
 
 
@@ -359,7 +385,10 @@ def load(manifest: dict, out_dir, loader, commit_check, batch_size: int = 1000) 
     bad = verify_parts(manifest, out_dir)
     if bad:
         raise ImportRefused("the parts do not match the manifest: " + "; ".join(bad))
-    req = batch_commit_params(manifest)
+    try:
+        req = batch_commit_params(manifest)
+    except (KeyError, TypeError) as exc:
+        raise ImportRefused("the manifest is malformed: %s" % exc)
     try:
         approved = commit_check(req["action"], req["params"]) is True
     except Exception:                                                  # noqa: BLE001 - a crashing check is a refusal
@@ -374,19 +403,24 @@ def load(manifest: dict, out_dir, loader, commit_check, batch_size: int = 1000) 
                 batch.append(json.loads(line.decode("utf-8")))
                 if len(batch) >= batch_size:
                     sent += len(batch)
-                    stored += _store(loader, batch)
+                    stored += _store(loader, batch, stored)
                     batch = []
     if batch:
         sent += len(batch)
-        stored += _store(loader, batch)
+        stored += _store(loader, batch, stored)
     expect = manifest["counts"]["nodes"] + manifest["counts"]["edges"] + manifest["counts"]["stubs"]
     if sent != expect or stored != sent:
         raise ImportRefused("count-back failed: manifest %d, sent %d, stored %d" % (expect, sent, stored))
     return {"sent": sent, "stored": stored, "batch_sha256": manifest["batch_sha256"]}
 
 
-def _store(loader, batch):
-    n = loader(batch)
+def _store(loader, batch, stored_so_far=0):
+    try:
+        n = loader(batch)
+    except ImportRefused:
+        raise
+    except Exception as exc:                                            # noqa: BLE001 - whatever the loader raises, the caller gets a refusal that says how far it got
+        raise ImportRefused("loader failed after %d records were stored: %r" % (stored_so_far, exc))
     if isinstance(n, bool) or not isinstance(n, int) or n < 0:
         raise ImportRefused("the loader must return how many records it stored")
     return n

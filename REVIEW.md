@@ -1,9 +1,9 @@
-# REVIEW (automated), 2026-10-17T09:24:41
+# REVIEW
 
-Repo: vega-dkg-lattice-sdk | python files 14 | seconds 62.0
-Findings: high 0, medium 0, low 0, info 0
-Tests: {"ran": true, "tests": 76, "ok": true, "redteam_files": {"1": 1, "2": 1}, "test_files": 5}
-Network-capable modules imported: none
+Repo: vega-dkg-lattice-sdk
 
-Limits: a clean scan is not proof of safety. Static rules are shallow; the copy check finds verbatim and light-edit copying against the 251-repo library only.
+Reviewed by reading every line of `vega_id`, `cards`, `candidate_verify`, `md_nodes`, `combine_finder`, `catalog`, `process` and `knowledge_import` against the README and SPEC, then reproducing each suspected defect before fixing it (see CHANGELOG.md, 2026-10-21).
+Tests: 133 in 9 files, all passing. Every fix is mutation-checked.
+Network-capable modules imported: none. Secret scan: clean.
 
+Limits: this is a first-party read, not an independent review. The scores measure structure, not whether code works. Concurrency fixes were checked with threads on one machine, not across machines. Nothing here has had an independent expert review.

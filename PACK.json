@@ -1,0 +1,15 @@
+{
+ "pack": "PACK-DKG-LATTICE",
+ "repo": "vega-dkg-lattice-sdk",
+ "members": [
+  "vega-dkg-lattice-sdk",
+  "vega-journal-sdk",
+  "vega-librarian-sdk",
+  "vega-galaxy-sdk",
+  "vega-reasoning-sdk"
+ ],
+ "requires": [],
+ "dkg_anchor": "DKG-REPO-PACKS-20261113",
+ "version": "v0.1",
+ "disclosed": "2026-11-13"
+}
